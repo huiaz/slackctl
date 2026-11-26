@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -11,13 +10,16 @@ import (
 func setupTestCredentials(t *testing.T) (cleanup func()) {
 	t.Helper()
 	tmpDir := t.TempDir()
-	origHome := os.Getenv("HOME")
-	os.Setenv("HOME", tmpDir)
-	// Create the config dir
-	os.MkdirAll(filepath.Join(tmpDir, ".config", "agent-slack"), 0o700)
-	return func() {
-		os.Setenv("HOME", origHome)
+	// 覆盖 os.UserHomeDir 在各平台使用的变量，恢复由测试框架负责。
+	for _, key := range []string{"HOME", "USERPROFILE", "home"} {
+		t.Setenv(key, tmpDir)
 	}
+	// 在任何配置读写之前断言真实解析路径，失败时不接触原目录。
+	if credentialsFile() != filepath.Join(tmpDir, ".config", "agent-slack", "credentials.json") {
+		t.Fatal("测试凭证路径没有落在合成目录中")
+	}
+	// 保留既有调用签名；目录由 SaveCredentials 创建并检查错误。
+	return func() {}
 }
 
 func TestUpsertAndLoadWorkspace(t *testing.T) {

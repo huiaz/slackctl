@@ -37,6 +37,7 @@ func NewRootCmd() *cobra.Command {
 		"Include message attachment title and text")
 
 	root.AddCommand(
+		newMCPCmd(),
 		newAuthCmd(),
 		newMessageCmd(),
 		newCanvasCmd(),

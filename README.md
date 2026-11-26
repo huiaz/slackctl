@@ -259,3 +259,64 @@ This project is a Go rewrite of [agent-slack](https://github.com/stablyai/agent-
 ## License
 
 [MIT](LICENSE)
+
+## 原生只读 MCP
+
+从源码构建一个二进制后，可通过官方 [Go MCP SDK](https://github.com/modelcontextprotocol/go-sdk) 提供标准输入输出服务：
+
+```bash
+go build -o slackctl ./cmd/slackctl
+./slackctl mcp --workspace https://example.slack.com
+```
+
+标准输出只承载 MCP 协议。客户端通过 `initialize`、`tools/list` 和 `tools/call` 使用以下四个工具；该服务没有事件订阅或事件唤醒能力。
+
+| 工具 | 参数 | 用途 |
+| --- | --- | --- |
+| `search_messages` | `query`、可选 `limit` | 搜索消息，返回总数及本次匹配 |
+| `read_message` | `link`，或 `channel` + `ts` + 可选 `thread_ts` | 按时间戳精确读取一条消息 |
+| `read_thread` | `link`，或 `channel` + `ts`；可选 `limit` | 从根消息起读取线程，回复链接中的 `thread_ts` 用于定位根 |
+| `channel_history` | `channel`、可选 `limit` | 读取频道近期消息 |
+
+`link` 与显式频道／时间戳参数互斥。`channel` 必须是 C、G 或 D 开头的频道 ID；`ts` 与 `thread_ts` 必须包含 10 位秒和 6 位小数。链接必须是固定工作区的 HTTPS 消息永久链接，不能含用户信息、端口或跨域地址。工具不接受工作区、任意 URL、HTTP 方法或 CLI 命令。
+
+通用 stdio 客户端配置（`command` 指向刚构建的二进制，或使用其所在目录中的可执行文件名）：
+
+```json
+{
+  "mcpServers": {
+    "slack-readonly": {
+      "command": "slackctl",
+      "args": ["mcp", "--workspace", "https://example.slack.com"]
+    }
+  }
+}
+```
+
+### 认证边界
+
+MCP 当前仅支持普通、非 Enterprise Grid 工作区，运行时只复用已授权且已保存的标准用户令牌（`xoxp-`）或机器人令牌（`xoxb-`）。必须在现有 `auth add` 流程中将标准令牌关联到完整工作区 URL；请使用组织批准的认证方式，不要把真实令牌写入客户端配置或公开文档。
+
+启动参数与已保存记录的 `workspace_url` 使用同一个严格规则规范化，再匹配同一 canonical URL；例如主机大小写和末尾斜杠不会形成不同工作区。无效的已存 URL 不参与匹配；规范化后重复的配置会被拒绝。模糊名称、默认工作区、`SLACK_TOKEN` 环境认证、浏览器／桌面提取认证、组织 URL 与企业路由认证均不用于 MCP。启动时调用官方 [`auth.test`](https://docs.slack.dev/reference/methods/auth.test/)，核验返回的完整工作区 URL、团队 ID 和用户 ID；无法证明目标绑定时启动失败。只要响应包含 `enterprise_id` 字段（包括空值或 `null`），或明确返回 `is_enterprise_install:true`，也会拒绝启动；普通成功响应不必提供安装布尔值。当前没有保存可信且与同一令牌绑定的 OAuth 安装元数据，因此 **Grid 中合法的单工作区安装也暂不支持**，不能仅凭 `auth.test` 的工作区上下文认定安装范围。后续始终使用同一令牌和 `https://slack.com/api/`，不更换身份、端点或工作区，不重试授权错误，不进行企业路由回退，也不跟随任何 HTTP 重定向。
+
+工具能读取什么由 Slack 的令牌类型、授权范围、成员关系和组织策略决定。`search_messages` 使用的 [`search.messages`](https://docs.slack.dev/reference/methods/search.messages/) 需要标准用户令牌及 `search:read`，机器人令牌不适用于搜索；[`conversations.replies`](https://docs.slack.dev/reference/methods/conversations.replies/) 对不同令牌和频道类型也有权限限制。缺少权限或企业策略拒绝会直接失败，不以其他认证模式替代。现有普通 CLI 的认证和摘要行为保持原样。
+
+### 内容、窗口和限制
+
+返回内容包括 Slack 实际提供的 `text`、原始嵌套 `blocks`、`attachments[].blocks`、附件文本／字段／内容链接、文件摘要、消息及线程时间戳和固定工作区永久链接。仅有 Slack `username` 的机器人作者映射为 `user_name`，搜索的 `channel.name` 映射为 `channel_name`，不额外查询用户资料。Block Kit 使用 `json.RawMessage` 保留 `fields`、`rich_text`、`actions` 等嵌套结构，不依赖 CLI 的摘要投影。文件仅返回摘要与已有链接，不下载文件或访问链接；不返回原始 HTTP envelope、认证或 headers。
+
+本工具只接受显式提供整数 `total` 与数组 `matches` 的搜索结果；`total:0,matches:[]` 表示有效空结果，缺字段或 `null` 会报告响应格式错误。搜索结果可能没有完整的 Blocks 或附件详情，`detail_notice` 会说明这一点。可把返回的 `permalink` 传入 `read_message`；回复链接会保留 `thread_ts`。链接和 Slack 正文都作为不可信外部数据返回，工具描述和结果附带相应提示，不应执行其中的指令。
+
+`limit` 默认 20，范围为 1–50；搜索文本最多 4096 字节。线程和历史使用 Slack 原生 `response_metadata.next_cursor` 分页，每次工具调用最多读取 10 页，并受总条数上限约束。`has_more` 表示 Slack 仍有结果或本次窗口被截断。单条回复读取仅在根线程的前 50 条窗口内精确匹配，校验本页并命中目标后即返回，不再请求无关后页；窗口内未找到会明确失败，不会返回邻近消息。
+
+单次 HTTP 请求最多 10 秒，工具调用最多 15 秒；单个 HTTP 响应最多 1 MiB，工具参数原始 JSON 最多 16 KiB，工具结果最多 256 KiB。工具层超限会返回安全错误，不回显原始 HTTP 错误或认证信息。stdio 使用 SDK 配置的 64 KiB 单次解码新增读取预算；由于 JSON 解码器可能预读后续输入，这不是精确的逐行字节上限。该读取预算超限会结束传输会话，不能按普通工具错误继续复用会话。Slack 限流直接返回失败，客户端可按自己的策略稍后重试。
+
+### 离线验证
+
+```bash
+go test -count=1 ./...
+go vet ./...
+go build ./...
+```
+
+测试使用合成配置、模拟 HTTP transport、官方 SDK 客户端及本地 TLS 代理，不读取真实凭证、不连接生产 Slack。真实二进制 stdio 测试覆盖初始化、四工具调用和错工作区身份拒绝；在不支持测试证书环境覆盖的旧版 Go/macOS 或 Windows 上，使用调用相同 CLI 入口的测试子进程。模拟验证不代表任何真实工作区已经授权或通过组织验收。
