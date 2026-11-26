@@ -7,9 +7,12 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/pem"
 	goversion "go/version"
@@ -46,7 +49,7 @@ func TestMCPBinaryStdio(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "合成测试"}, DNSNames: []string{"slack.com"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	template := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "合成测试"}, DNSNames: []string{"slack.com", "wss-primary.slack.com"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
@@ -57,8 +60,9 @@ func TestMCPBinaryStdio(t *testing.T) {
 	}
 	var requests atomic.Int32
 	var reject atomic.Bool
+	var writeRequests atomic.Int32
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "CONNECT" || r.Host != "slack.com:443" {
+		if r.Method != "CONNECT" || (r.Host != "slack.com:443" && r.Host != "wss-primary.slack.com:443") {
 			t.Error("子进程请求了非固定端点")
 			http.Error(w, "拒绝", 403)
 			return
@@ -84,10 +88,25 @@ func TestMCPBinaryStdio(t *testing.T) {
 				return
 			}
 			requests.Add(1)
+			if request.Host == "wss-primary.slack.com" {
+				if request.Method != "GET" || request.Header.Get("Authorization") != "Bearer xoxp-synthetic" || request.Header.Get("Upgrade") != "websocket" {
+					t.Error("WS 身份或握手错误")
+					return
+				}
+				hash := sha1.Sum([]byte(request.Header.Get("Sec-WebSocket-Key") + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+				response := &http.Response{StatusCode: 101, ProtoMajor: 1, ProtoMinor: 1, Header: http.Header{"Upgrade": {"websocket"}, "Connection": {"Upgrade"}, "Sec-Websocket-Accept": {base64.StdEncoding.EncodeToString(hash[:])}}}
+				if response.Write(tlsConn) != nil {
+					return
+				}
+				writeSyntheticFrame(tlsConn, `{"type":"hello","team_id":"TEXAMPLE1"}`)
+				writeSyntheticFrame(tlsConn, `{"type":"message","team":"TEXAMPLE1","channel":"CEXAMPLE1","ts":"1700000000.000001","user":"UOTHER1","text":"<@UEXAMPLE1> 合成正文","blocks":[{"type":"section","text":{"type":"plain_text","text":"合成字段"}}]}`)
+				_, _ = io.Copy(io.Discard, tlsConn)
+				return
+			}
 			if request.Method != "POST" || request.Host != "slack.com" || request.Header.Get("Authorization") != "Bearer xoxp-synthetic" {
 				t.Error("请求身份或方法改变")
 			}
-			_, _ = io.Copy(io.Discard, request.Body)
+			_ = request.ParseForm()
 			_ = request.Body.Close()
 			body := `{"ok":true,"messages":[{"ts":"1700000000.000001","text":"合成消息"}]}`
 			switch request.URL.Path {
@@ -99,6 +118,23 @@ func TestMCPBinaryStdio(t *testing.T) {
 			case "/api/search.messages":
 				body = `{"ok":true,"messages":{"total":1,"matches":[{"channel":{"id":"CEXAMPLE1"},"ts":"1700000000.000001","text":"合成消息"}]}}`
 			case "/api/conversations.history", "/api/conversations.replies":
+			case "/api/chat.postMessage":
+				writeRequests.Add(1)
+				if request.Form.Get("channel") != "CEXAMPLE1" || request.Form.Get("text") != "*合成写入*" || request.Form.Get("reply_broadcast") != "false" {
+					t.Error("实际消息 payload 错误")
+				}
+				if root := request.Form.Get("thread_ts"); root != "" && root != "1700000000.000001" {
+					t.Error("实际回复未回到根线程")
+				}
+				body = `{"ok":true,"channel":"CEXAMPLE1","ts":"1700000002.000001"}`
+			case "/api/reactions.add":
+				writeRequests.Add(1)
+				if request.Form.Get("timestamp") != "1700000001.000002" || request.Form.Get("name") != "wave" {
+					t.Error("实际 reaction payload 错误")
+				}
+				body = `{"ok":false,"error":"already_reacted"}`
+			case "/api/rtm.connect":
+				body = `{"ok":true,"url":"wss://wss-primary.slack.com/synthetic","team":{"id":"TEXAMPLE1"},"self":{"id":"UEXAMPLE1"}}`
 			default:
 				t.Error("出现非只读方法")
 			}
@@ -194,11 +230,139 @@ func TestMCPBinaryStdio(t *testing.T) {
 	if requests.Load() != 6 {
 		t.Fatal("错身份发生重试或回退")
 	}
+	reject.Store(false)
+	t.Run("显式写入和默认预览", func(t *testing.T) {
+		cmd := newCommand("mcp", "--workspace", "https://example.slack.com", "--enable-writes")
+		cmd.Env = childEnv
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		cs, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cs.Close()
+		listed, err := cs.ListTools(ctx, nil)
+		if err != nil || len(listed.Tools) != 7 {
+			t.Fatal("写开关没有独立注册三个工具")
+		}
+		for name, args := range map[string]map[string]any{
+			"send_message": {"channel": "CEXAMPLE1", "text": "*合成写入*"},
+			"reply_thread": {"link": "https://example.slack.com/archives/CEXAMPLE1/p1700000001000002?thread_ts=1700000000.000001", "text": "*合成写入*"},
+			"add_reaction": {"link": "https://example.slack.com/archives/CEXAMPLE1/p1700000001000002?thread_ts=1700000000.000001", "name": "wave"},
+		} {
+			before := writeRequests.Load()
+			r, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+			if err != nil || r.IsError || writeRequests.Load() != before {
+				t.Fatal("默认预览发出写请求")
+			}
+			args["dry_run"] = false
+			r, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+			if err != nil || r.IsError || writeRequests.Load() != before+1 {
+				t.Fatal("显式写入失败")
+			}
+		}
+		before := writeRequests.Load()
+		r, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "reply_thread", Arguments: map[string]any{"link": "https://other.slack.com/archives/CEXAMPLE1/p1700000000000001", "text": "合成", "dry_run": false}})
+		if err != nil || !r.IsError || writeRequests.Load() != before {
+			t.Fatal("跨域写入未拒绝")
+		}
+		_ = cs.Close()
+		if stderr.Len() != 0 {
+			t.Fatal("写入泄漏协议外输出")
+		}
+	})
+	t.Run("实时事件独立读取", func(t *testing.T) {
+		cmd := newCommand("mcp", "--workspace", "https://example.slack.com", "--enable-events")
+		cmd.Env = childEnv
+		cs, err := client.Connect(ctx, &mcp.CommandTransport{Command: cmd}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cs.Close()
+		listed, err := cs.ListTools(ctx, nil)
+		if err != nil || len(listed.Tools) != 5 {
+			t.Fatal("事件开关注册了写工具")
+		}
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			r, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "list_events", Arguments: map[string]any{}})
+			if err != nil || r.IsError {
+				t.Fatal("事件读取失败")
+			}
+			data, _ := json.Marshal(r)
+			if bytes.Contains(data, []byte("合成字段")) {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("实时事件没有进入队列")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
+	t.Run("常驻入口模拟唤醒", func(t *testing.T) {
+		receiver := filepath.Join(dir, "synthetic-receiver")
+		source := filepath.Join(dir, "receiver.go")
+		code := `package main
+import("os";"path/filepath";"encoding/json")
+func main(){a:=os.Args[1:];if len(a)!=14||a[0]!="orchestration"||a[1]!="send"||a[3]!="local"||a[5]!="bot:example-bot"||a[7]!="bot:example-bot"||a[9]!="handoff"||a[11]!="Slack 事件通知"||a[12]!="--body-file"{os.Exit(2)};b,e:=os.ReadFile(a[13]);if e!=nil{os.Exit(3)};var v map[string]any;if json.Unmarshal(b,&v)!=nil{os.Exit(4)};p,_:=os.Executable();if os.WriteFile(filepath.Join(filepath.Dir(p),"wake-receipt.json"),b,0600)!=nil{os.Exit(5)}}`
+		if err := os.WriteFile(source, []byte(code), 0600); err != nil {
+			t.Fatal(err)
+		}
+		build := exec.CommandContext(t.Context(), "go", "build", "-o", receiver, source)
+		if out, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("模拟端构建失败: %v %s", err, out)
+		}
+		cmd := newCommand("mcp", "listen", "--workspace", "https://example.slack.com", "--enable-local-wake", "--orca-path", receiver, "--orca-bot", "example-bot", "--wake-channels", "CEXAMPLE1", "--wake-mentions")
+		cmd.Env = childEnv
+		var out, logs bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &logs
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if cmd.ProcessState == nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			}
+		}()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			data, err := os.ReadFile(filepath.Join(dir, "wake-receipt.json"))
+			if err == nil {
+				if bytes.Contains(data, []byte("合成正文")) || bytes.Contains(data, []byte("UOTHER1")) || !bytes.Contains(data, []byte("CEXAMPLE1")) {
+					t.Fatal("唤醒载荷越界")
+				}
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("常驻事件未触发模拟本机唤醒")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		_ = cmd.Process.Signal(os.Interrupt)
+		if err := cmd.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if out.Len() != 0 || strings.Contains(logs.String(), "xoxp-") {
+			t.Fatal("常驻模式输出泄漏")
+		}
+	})
 	mode := "真实二进制"
 	if useHelper {
 		mode = "相同 CLI 入口的测试子进程（旧系统证书兼容）"
 	}
 	t.Logf("%s initialize、tools/list、四次 tools/call 与错身份启动检查均通过；所有 HTTPS 请求仅到本地合成代理", mode)
+}
+
+func writeSyntheticFrame(w io.Writer, text string) {
+	b := []byte(text)
+	header := []byte{0x81, byte(len(b))}
+	if len(b) >= 126 {
+		header = []byte{0x81, 126, 0, 0}
+		binary.BigEndian.PutUint16(header[2:], uint16(len(b)))
+	}
+	_, _ = w.Write(append(header, b...))
 }
 
 func TestMCPStdioHelper(t *testing.T) {

@@ -260,7 +260,7 @@ This project is a Go rewrite of [agent-slack](https://github.com/stablyai/agent-
 
 [MIT](LICENSE)
 
-## 原生只读 MCP
+## 原生 MCP（默认只读）
 
 从源码构建一个二进制后，可通过官方 [Go MCP SDK](https://github.com/modelcontextprotocol/go-sdk) 提供标准输入输出服务：
 
@@ -269,7 +269,7 @@ go build -o slackctl ./cmd/slackctl
 ./slackctl mcp --workspace https://example.slack.com
 ```
 
-标准输出只承载 MCP 协议。客户端通过 `initialize`、`tools/list` 和 `tools/call` 使用以下四个工具；该服务没有事件订阅或事件唤醒能力。
+标准输出只承载 MCP 协议。默认仅注册以下四个只读工具，客户端通过 `initialize`、`tools/list` 和 `tools/call` 使用；写入、实时事件和本机唤醒均需单独显式启用。
 
 | 工具 | 参数 | 用途 |
 | --- | --- | --- |
@@ -309,14 +309,79 @@ MCP 当前仅支持普通、非 Enterprise Grid 工作区，运行时只复用�
 
 `limit` 默认 20，范围为 1–50；搜索文本最多 4096 字节。线程和历史使用 Slack 原生 `response_metadata.next_cursor` 分页，每次工具调用最多读取 10 页，并受总条数上限约束。`has_more` 表示 Slack 仍有结果或本次窗口被截断。单条回复读取仅在根线程的前 50 条窗口内精确匹配，校验本页并命中目标后即返回，不再请求无关后页；窗口内未找到会明确失败，不会返回邻近消息。
 
-单次 HTTP 请求最多 10 秒，工具调用最多 15 秒；单个 HTTP 响应最多 1 MiB，工具参数原始 JSON 最多 16 KiB，工具结果最多 256 KiB。工具层超限会返回安全错误，不回显原始 HTTP 错误或认证信息。stdio 使用 SDK 配置的 64 KiB 单次解码新增读取预算；由于 JSON 解码器可能预读后续输入，这不是精确的逐行字节上限。该读取预算超限会结束传输会话，不能按普通工具错误继续复用会话。Slack 限流直接返回失败，客户端可按自己的策略稍后重试。
+单次 HTTP 请求最多 10 秒，工具调用最多 15 秒；单个 HTTP 响应最多 1 MiB，工具参数原始 JSON 最多 16 KiB，工具结果最多 256 KiB。工具层超限会返回安全错误，不回显原始 HTTP 错误或认证信息。stdio 使用 SDK 配置的 64 KiB 单次解码新增读取预算；由于 JSON 解码器可能预读后续输入，这不是精确的逐行字节上限。该读取预算超限会结束传输会话，不能按普通工具错误继续复用会话。Slack 限流直接返回失败；读取可由客户端稍后重试，写入必须先核实结果，不能自动重试。
 
-### 离线验证
+### 显式写入与预览
 
-```bash
-go test -count=1 ./...
-go vet ./...
-go build ./...
+`--enable-writes` 独立增加 `send_message`、`reply_thread`、`add_reaction`；不启用事件或唤醒。缺省 `dry_run` 或 `dry_run:true` 只返回目标、内容与动作预览，不发出写请求。只有显式 `dry_run:false` 才执行，**工具参数不能替代宿主的用户审批**；宿主仍须核对目标、内容和动作并遵循其审批规则。既有普通 CLI 写命令的行为不变。
+
+| 工具 | 目标与内容 |
+| --- | --- |
+| `send_message` | 必填 `channel`、`text`；直接发送必须明确频道 ID，不解析频道名或开启私聊 |
+| `reply_thread` | `link` 或 `channel` + 根 `ts`，必填 `text`；回复链接含 `thread_ts` 时使用线程根，始终设置 `reply_broadcast:false` |
+| `add_reaction` | `link` 或 `channel` + 精确消息 `ts`，必填 `name`；回复链接仍定位链接中的具体消息，不改为线程根 |
+
+消息正文沿用既有 Slack `text`／mrkdwn 语义，最多 12000 字节。可选原生 `blocks` 为 1–50 个对象，JSON 总计最多 16000 字节，正文始终作为回退文本。表情名不带冒号，只允许字母、数字、下划线、加减号，长度 1–100；`already_reacted` 作为成功返回 `already_reacted:true`。写工具原始参数最多 48 KiB，结果仍受 256 KiB 上限约束。
+
+```json
+{"channel":"CEXAMPLE1","text":"*合成通知*"}
 ```
 
-测试使用合成配置、模拟 HTTP transport、官方 SDK 客户端及本地 TLS 代理，不读取真实凭证、不连接生产 Slack。真实二进制 stdio 测试覆盖初始化、四工具调用和错工作区身份拒绝；在不支持测试证书环境覆盖的旧版 Go/macOS 或 Windows 上，使用调用相同 CLI 入口的测试子进程。模拟验证不代表任何真实工作区已经授权或通过组织验收。
+上述参数仅预览。审批后同一动作显式增加 `"dry_run":false` 才会调用固定的 `chat.postMessage` 或 `reactions.add`。目标仍绑定启动时 `auth.test` 核验的工作区和身份，不提供改写方法、认证或端点的参数；远端拒绝、超时或不合法响应不会触发自动重试。错误只返回脱敏说明，结果不明时先读取目标核实。实际写权限依赖组织授权、令牌权限和频道成员关系，模拟通过不代表已具备这些权限。
+
+### 显式实时事件
+
+`--enable-events` 在启动阶段使用同一标准令牌调用固定 `rtm.connect`，核验返回的 `team.id` 和 `self.id` 与 `auth.test` 完全相同，再建立 WSS。只允许 `wss-primary.slack.com`、`wss-backup.slack.com`、`wss-mobile.slack.com`，拒绝自定义端口、用户信息、片段和重定向。连接地址、认证和原始协议错误不写日志。连接后事件或握手中提供团队字段时必须匹配；身份无法证实即失败关闭。
+
+严格事件管线复用既有 `listen` 的消息解析、过滤投影和指数退避，不使用旧 listener 的宽松认证、任意端点、原始协议输出或命令执行能力。每次重连重新请求并核验 `rtm.connect`；`reconnect_url` 只验证，不直接采用。WS 断连与暂时连接故障退避重连，明确的授权或不支持错误停止。状态诊断仅写 stderr。
+
+RTM 支持取决于 Slack 当前的凭证与应用类型。标准令牌通过 `auth.test` **不等于**可以使用 RTM，尤其不能假定现代机器人令牌可使用旧 RTM；Slack 返回不支持、缺权限或受限时会明确失败，绝不回退到浏览器令牌、其他工作区或其他事件入口。当前未进行真实 Slack 凭证验收。
+
+事件接收在独立后台循环实时完成，不依赖客户端轮询，也不调用 Slack 写工具。启用后新增只读 `list_events`：
+
+```json
+{"limit":20}
+```
+
+首次空游标返回最早保留事件，之后把上次返回的 `cursor` 传回继续读取；读取不消费其他客户端的游标。没有新事件返回空数组。`status` 区分 `connecting`、`connected`、`disconnected`、`failed`、`stopped`；未开启事件时工具根本不注册，内部未启用状态为 `disabled`。过期或旧进程游标返回 `cursor_expired:true`、空结果和重置用游标，客户端确认丢失后再用该游标读取。错误格式或超前游标明确报错。
+
+队列最多 512 条，去重保留最近 1024 个业务事件指纹，溢出丢弃最早事件并增加 `dropped`。帧最多 64 KiB，投影正文最多 2000 个字符，单条业务 JSON 最多 16 KiB；超限 Blocks 被去除并标记 `truncated`。每页最多 50 条且业务 JSON 总计不超过约 96 KiB，`has_more` 提示继续读取。只输出消息类事件（含修改与删除）的相关 ID、类型、时间戳、正文和必要 Blocks；不输出 presence、原始 envelope、握手 URL 或认证字段。正文、Blocks 与链接都是不可信数据。
+
+**RTM 不重放断线期间事件。** 当前队列和游标只存内存，进程重启、队列溢出和断连均可能产生缺口；客户端应保留游标，处理断连和过期状态，必要时另行读取频道历史补查。当前没有实现资源订阅或自定义 MCP 通知协议。
+
+### 可选本机 Orca 唤醒与常驻模式
+
+仅本机部署者可以通过启动参数启用 `--enable-local-wake`，同时提供可信可执行文件绝对路径 `--orca-path`、固定 `--orca-bot`，以及明确的频道白名单或人的 DM 过滤。MCP tools 和 Slack 事件都不能设置或改变这些入口。没有 HTTP 接收服务、HTTPS webhook、外发回调或其他通道。
+
+以下仅为将来授权部署时的通用示例，**本次未配置或启动实际自动化**：
+
+```bash
+slackctl mcp listen --workspace https://example.slack.com --enable-local-wake --orca-path /opt/example/bin/orca --orca-bot example-bot --wake-channels CEXAMPLE1 --wake-mentions --wake-dms
+```
+
+`slackctl mcp listen` 与 MCP 内的事件接收共用同一严格管线，独立运行且不依赖主管理者 MCP 会话存活。它不提供 stdio 工具服务，也不向 stdout 输出 Slack 正文；接收状态与失败计数写 stderr。需要外部进程管理方保持运行，本次不创建 LaunchAgent、计划任务、既有安装或配置。普通 MCP 会话内启用唤醒则额外需要 `--enable-events`，会话退出即停止该进程内的事件入口。
+
+本机适配器通过直接 exec 固定子命令传递引用：
+
+```text
+/opt/example/bin/orca orchestration send --environment local --to bot:example-bot --from bot:example-bot --type handoff --subject "Slack 事件通知" --body-file <权限为0600的临时JSON文件>
+```
+
+不经过 shell，不允许额外参数、任意子命令、远端主机或 `--chat`，省略 `--chat` 落到固定 bot 的 Home Chat。子进程不继承代理、配对码、令牌或动态 Orca 远端环境，仅保留本机运行所需的有限环境。载荷只包含版本、固定种类、消息计数与频道、消息 ts、根 ts、事件类型等引用，不转交 Slack 正文、链接、用户标识或凭证。事件不能被当作指令。
+
+白名单频道告警默认按频道合并 180 秒，可通过 `--wake-window` 调整为 1 秒至 1 小时；每批最多 16 个引用，保留总数和截断标记。`--wake-mentions` 只让白名单频道中的直接提及立即唤醒；`--wake-dms` 显式允许人的直接私信立即唤醒，跳过自身及带 bot/app 标识的普通 DM。不默认监控整个工作区，不将修改或删除消息当作新告警。最近 4096 个频道与消息 ts 用于唤醒去重。
+
+事件入队、聚合和 IPC 执行相互分离，不阻塞读写工具。输入队列最多 256 条，发送队列最多 64 批，最多 128 个待聚合频道；超限与停止时未投递数据有明确记录。每次本机执行最多 10 秒，失败最多尝试 3 次，间隔 1、2 秒；子进程输出全部丢弃，只记录固定脱敏失败信息。IPC 结果可能不明，重试可能重复投递，接收方应按引用去重。临时载荷文件在成功、失败或正常取消后删除；异常终止可能留下只含引用的临时文件。不保证断电持久化或恰好一次投递。
+
+### 离线验证与部署前提
+
+```bash
+GOPROXY=off go test -count=1 ./...
+GOTOOLCHAIN=go1.25.0 GOPROXY=off go test -count=1 ./...
+go test -race ./internal/slack ./internal/mcpevents ./internal/localwake ./internal/mcpserver ./internal/cli
+go vet ./...
+go build ./...
+git diff --check
+```
+
+测试只使用合成凭证、模拟 HTTP／WS、官方 SDK 客户端、本地 TLS 代理和临时编译的模拟本机接收端，不读取真实凭证、不连接生产 Slack，也不执行真实 Orca bot 发送。真实二进制 stdio 测试覆盖初始化、默认四工具、写入预览与实际 mock payload、目标边界、事件独立读取及常驻模式模拟唤醒；旧版 Go/macOS 或 Windows 使用相同 CLI 入口的测试子进程处理合成证书兼容。已验证的是模拟行为，不是实际 Slack 权限、真实 RTM 可用性或 Orca 部署验收。真实事件触发仍需单独授权部署并验收。

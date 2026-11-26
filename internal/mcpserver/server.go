@@ -42,7 +42,7 @@ var definitions = []toolDefinition{
 }
 
 // NewServer 使用 SDK 管理协议，不注册任意 HTTP、CLI 或工作区切换工具。
-func NewServer(client *slack.ReadOnlyClient, version string) *mcp.Server {
+func NewServer(client *slack.ReadOnlyClient, version string, options ...Options) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "slackctl", Version: version}, &mcp.ServerOptions{Instructions: notice})
 	for _, def := range definitions {
 		server.AddTool(&mcp.Tool{Name: def.name, Description: def.description + notice, InputSchema: schema(def), Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true}}, func(ctx context.Context, request *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -68,6 +68,9 @@ func NewServer(client *slack.ReadOnlyClient, version string) *mcp.Server {
 			}
 			return result, nil
 		})
+	}
+	if len(options) > 0 {
+		registerOptional(server, client, options[0])
 	}
 	return server
 }

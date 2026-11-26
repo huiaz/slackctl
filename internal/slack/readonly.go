@@ -44,6 +44,8 @@ func CanonicalReadOnlyWorkspace(raw string) (string, error) {
 type ReadOnlyClient struct {
 	workspace string
 	token     string
+	teamID    string
+	userID    string
 	http      *http.Client
 }
 
@@ -74,6 +76,7 @@ func NewReadOnlyClient(ctx context.Context, a Auth, workspace string, transport 
 	if err != nil || actual != canonical || !teamPattern.MatchString(identity.TeamID) || !IsUserID(identity.UserID) || identity.EnterpriseInstall || len(identity.EnterpriseID) != 0 {
 		return nil, errReadOnlyAuth
 	}
+	c.teamID, c.userID = identity.TeamID, identity.UserID
 	return c, nil
 }
 
@@ -81,6 +84,16 @@ func (c *ReadOnlyClient) api(ctx context.Context, method string, params url.Valu
 	// 允许列表同时约束内部调用，避免未来误用为通用写入客户端。
 	switch method {
 	case "auth.test", "search.messages", "conversations.history", "conversations.replies":
+	default:
+		return errReadOnlyArgs
+	}
+	return c.fixedAPI(ctx, method, params, out)
+}
+
+// fixedAPI 仅供经过固定方法校验的内部入口使用，不重试远端请求。
+func (c *ReadOnlyClient) fixedAPI(ctx context.Context, method string, params url.Values, out any) error {
+	switch method {
+	case "auth.test", "search.messages", "conversations.history", "conversations.replies", "chat.postMessage", "reactions.add", "rtm.connect":
 	default:
 		return errReadOnlyArgs
 	}
@@ -116,8 +129,17 @@ func (c *ReadOnlyClient) api(ctx context.Context, method string, params url.Valu
 		return errReadOnlyResponse
 	}
 	if !envelope.OK {
+		if method == "rtm.connect" {
+			switch envelope.Error {
+			case "not_allowed_token_type", "not_allowed", "method_deprecated", "team_disabled":
+				return ErrEventUnsupported
+			}
+		}
+		if method == "reactions.add" && envelope.Error == "already_reacted" {
+			return errAlreadyReacted
+		}
 		switch envelope.Error {
-		case "invalid_auth", "not_authed", "missing_scope", "token_revoked", "account_inactive", "enterprise_is_restricted", "org_login_required", "team_access_not_granted":
+		case "invalid_auth", "not_authed", "missing_scope", "token_revoked", "token_expired", "account_inactive", "enterprise_is_restricted", "org_login_required", "team_access_not_granted":
 			return errReadOnlyAuth
 		}
 		return errors.New("Slack 拒绝请求，请检查权限及参数。")

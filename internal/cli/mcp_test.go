@@ -21,3 +21,17 @@ func TestMCPHelpDocumentsNonEnterpriseScope(t *testing.T) {
 		t.Fatal("帮助未说明 Grid 支持边界")
 	}
 }
+
+func TestMCPExplicitCapabilities(t *testing.T) {
+	cmd := newMCPCmd()
+	for _, name := range []string{"enable-writes", "enable-events"} {
+		flag := cmd.Flags().Lookup(name)
+		if flag == nil || flag.DefValue != "false" {
+			t.Errorf("缺少默认关闭的独立开关 %s", name)
+		}
+	}
+	listen, _, err := cmd.Find([]string{"listen"})
+	if err != nil || listen == cmd || listen.Name() != "listen" {
+		t.Fatal("缺少独立常驻入口")
+	}
+}
